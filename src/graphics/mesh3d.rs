@@ -831,7 +831,7 @@ impl<I: FromPrimitive> obj::FromRawVertex<I> for Vertex3d {
 }
 
 /// Model is an abstracted type for holding things like obj, gltf, or anything that may be made up of multiple meshes.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Model {
     /// The meshes that make up the model
     pub meshes: Vec<Mesh3d>,
