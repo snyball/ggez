@@ -18,7 +18,7 @@ use num_traits::FromPrimitive;
 #[cfg(feature = "gltf")]
 use std::path::Path;
 
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use mint::{Vector2, Vector3};
 use std::sync::Arc;
 use wgpu::{util::DeviceExt, vertex_attr_array};
@@ -78,6 +78,10 @@ pub struct Vertex3d {
     pub color: [f32; 4],
     /// Normal of this vertex (the direction it faces)
     pub normals: [f32; 3],
+    /// Tangent
+    pub tangent: [f32; 3],
+    /// Bitangent
+    pub bitangent: [f32; 3],
 }
 
 impl Vertex3d {
@@ -101,15 +105,19 @@ impl Vertex3d {
             tex_coord: uv.into(),
             color,
             normals: normals.into(),
+            tangent: [0.0; 3],
+            bitangent: [0.0; 3],
         }
     }
 
     pub(crate) fn desc() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRIBS: [wgpu::VertexAttribute; 4] = vertex_attr_array![
+        const ATTRIBS: [wgpu::VertexAttribute; 6] = vertex_attr_array![
             0 => Float32x3,
             1 => Float32x2,
             2 => Float32x4,
             3 => Float32x3,
+            4 => Float32x3,
+            5 => Float32x3,
         ];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex3d>() as _,
@@ -142,11 +150,11 @@ impl Mesh3dBuilder {
 
     /// Add data that makes up a mesh.
     pub fn from_data(
-        &mut self,
+        mut self,
         vertices: Vec<Vertex3d>,
         indices: Vec<u32>,
         texture: Option<Image>,
-    ) -> &mut Self {
+    ) -> Self {
         self.vertices = vertices;
         self.indices = indices;
         self.texture = texture;
@@ -615,8 +623,79 @@ impl Mesh3dBuilder {
         self
     }
 
+    /// Calculate tangents and bitangents from vertex data
+    pub fn calc_tangents(&mut self) {
+        let mut triangles_included = vec![0; self.vertices.len()];
+
+        // Calculate tangents and bitangets. We're going to
+        // use the triangles, so we need to loop through the
+        // indices in chunks of 3
+        for c in self.indices.chunks(3) {
+            let v0 = self.vertices[c[0] as usize];
+            let v1 = self.vertices[c[1] as usize];
+            let v2 = self.vertices[c[2] as usize];
+
+            let pos0: Vec3 = v0.pos.into();
+            let pos1: Vec3 = v1.pos.into();
+            let pos2: Vec3 = v2.pos.into();
+
+            let uv0: Vec2 = v0.tex_coord.into();
+            let uv1: Vec2 = v1.tex_coord.into();
+            let uv2: Vec2 = v2.tex_coord.into();
+
+            // Calculate the edges of the triangle
+            let delta_pos1 = pos1 - pos0;
+            let delta_pos2 = pos2 - pos0;
+
+            // This will give us a direction to calculate the
+            // tangent and bitangent
+            let delta_uv1 = uv1 - uv0;
+            let delta_uv2 = uv2 - uv0;
+
+            // Solving the following system of equations will
+            // give us the tangent and bitangent.
+            //     delta_pos1 = delta_uv1.x * T + delta_u.y * B
+            //     delta_pos2 = delta_uv2.x * T + delta_uv2.y * B
+            // Luckily, the place I found this equation provided
+            // the solution!
+            let r = 1.0 / (delta_uv1.x * delta_uv2.y - delta_uv1.y * delta_uv2.x);
+            let tangent = (delta_pos1 * delta_uv2.y - delta_pos2 * delta_uv1.y) * r;
+            // We flip the bitangent to enable right-handed normal
+            // maps with wgpu texture coordinate system
+            let bitangent = (delta_pos2 * delta_uv1.x - delta_pos1 * delta_uv2.x) * -r;
+
+            // We'll use the same tangent/bitangent for each vertex in the triangle
+            self.vertices[c[0] as usize].tangent =
+                (tangent + Vec3::from(self.vertices[c[0] as usize].tangent)).into();
+            self.vertices[c[1] as usize].tangent =
+                (tangent + Vec3::from(self.vertices[c[1] as usize].tangent)).into();
+            self.vertices[c[2] as usize].tangent =
+                (tangent + Vec3::from(self.vertices[c[2] as usize].tangent)).into();
+            self.vertices[c[0] as usize].bitangent =
+                (bitangent + Vec3::from(self.vertices[c[0] as usize].bitangent)).into();
+            self.vertices[c[1] as usize].bitangent =
+                (bitangent + Vec3::from(self.vertices[c[1] as usize].bitangent)).into();
+            self.vertices[c[2] as usize].bitangent =
+                (bitangent + Vec3::from(self.vertices[c[2] as usize].bitangent)).into();
+
+            // Used to average the tangents/bitangents
+            triangles_included[c[0] as usize] += 1;
+            triangles_included[c[1] as usize] += 1;
+            triangles_included[c[2] as usize] += 1;
+        }
+
+        // Average the tangents/bitangents
+        for (i, n) in triangles_included.into_iter().enumerate() {
+            let denom = 1.0 / n as f32;
+            let v = &mut self.vertices[i];
+            v.tangent = (Vec3::from(v.tangent) * denom).into();
+            v.bitangent = (Vec3::from(v.bitangent) * denom).into();
+        }
+    }
+
     /// Make a `Mesh3d` from this builder
-    pub fn build(&self, gfx: &mut impl HasMut<GraphicsContext>) -> Mesh3d {
+    pub fn build(mut self, gfx: &mut impl HasMut<GraphicsContext>) -> Mesh3d {
+        self.calc_tangents();
         let gfx = gfx.retrieve_mut();
         let verts = gfx
             .wgpu()
@@ -766,6 +845,8 @@ impl<I: FromPrimitive> obj::FromRawVertex<I> for Vertex3d {
                         tex_coord: [v.0 .1 .0, v.0 .1 .1],
                         color: [1.0, 1.0, 1.0, 1.0],
                         normals: [v.1 .0, v.1 .1, v.1 .2],
+                        tangent: [0.0; 3],
+                        bitangent: [0.0; 3],
                     }
                 })
                 .collect()
@@ -777,6 +858,8 @@ impl<I: FromPrimitive> obj::FromRawVertex<I> for Vertex3d {
                     tex_coord: [0.0, 0.0],
                     color: [1.0, 1.0, 1.0, 1.0],
                     normals: [0.0, 0.0, 0.0],
+                    tangent: [0.0; 3],
+                    bitangent: [0.0; 3],
                 })
                 .collect()
         };
