@@ -1,7 +1,6 @@
 use super::{
-    context::{FrameArenas, GraphicsContext},
+    context::GraphicsContext,
     gpu::{
-        arc::{ArcBindGroup, ArcBindGroupLayout, ArcShaderModule, ArcTextureView},
         bind_group::{BindGroupBuilder, BindGroupCache, BindGroupLayoutBuilder},
         growing::{ArenaAllocation, GrowingBufferArena},
         pipeline::{PipelineCache, RenderPipelineInfo},
@@ -22,14 +21,13 @@ use std::hash::Hash;
 #[allow(missing_debug_implementations)]
 pub struct InternalCanvas3d<'a> {
     wgpu: &'a WgpuContext,
-    arenas: &'a FrameArenas,
     bind_group_cache: &'a mut BindGroupCache,
     pipeline_cache: &'a mut PipelineCache,
     sampler_cache: &'a mut SamplerCache,
     uniform_arena: &'a mut GrowingBufferArena,
 
     shader: Shader,
-    shader_bind_group: Option<(&'a wgpu::BindGroup, ArcBindGroupLayout, u32)>,
+    shader_bind_group: Option<(wgpu::BindGroup, wgpu::BindGroupLayout, u32)>,
 
     shader_ty: Option<ShaderType3d>,
     dirty_pipeline: bool,
@@ -39,12 +37,12 @@ pub struct InternalCanvas3d<'a> {
     samples: u32,
     format: wgpu::TextureFormat,
 
-    draw_sm: ArcShaderModule,
-    instance_sm: ArcShaderModule,
-    instance_unordered_sm: ArcShaderModule,
+    draw_sm: &'a wgpu::ShaderModule,
+    instance_sm: &'a wgpu::ShaderModule,
+    instance_unordered_sm: &'a wgpu::ShaderModule,
 
     transform: glam::Mat4,
-    curr_image: Option<ArcTextureView>,
+    curr_image: Option<wgpu::TextureView>,
     curr_sampler: Sampler,
     next_sampler: Sampler,
 
@@ -66,7 +64,7 @@ impl<'a> InternalCanvas3d<'a> {
             cmd.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: image.view.as_ref(),
+                    view: &image.view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: match clear.into() {
@@ -119,8 +117,8 @@ impl<'a> InternalCanvas3d<'a> {
             cmd.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: msaa_image.view.as_ref(),
-                    resolve_target: Some(resolve_image.view.as_ref()),
+                    view: &msaa_image.view,
+                    resolve_target: Some(&resolve_image.view),
                     ops: wgpu::Operations {
                         load: match clear.into() {
                             None => wgpu::LoadOp::Load,
@@ -163,13 +161,9 @@ impl<'a> InternalCanvas3d<'a> {
         let sampler_cache = &mut gfx.sampler_cache;
         let uniform_arena = &mut gfx.uniform_arena;
 
-        let (arenas, mut pass) = {
+        let mut pass = {
             let fcx = gfx.fcx.as_mut().unwrap(/* see above */);
-
-            let pass = create_pass(&mut fcx.cmd);
-            let arenas = &fcx.arenas;
-
-            (arenas, pass)
+            create_pass(&mut fcx.cmd)
         };
 
         pass.set_blend_constant(wgpu::Color::BLACK);
@@ -189,7 +183,6 @@ impl<'a> InternalCanvas3d<'a> {
 
         Ok(InternalCanvas3d {
             wgpu,
-            arenas,
             bind_group_cache,
             pipeline_cache,
             sampler_cache,
@@ -205,9 +198,9 @@ impl<'a> InternalCanvas3d<'a> {
             samples,
             format,
 
-            draw_sm: gfx.draw_shader_3d.clone(),
-            instance_sm: gfx.instance_shader_3d.clone(),
-            instance_unordered_sm: gfx.instance_unordered_shader_3d.clone(),
+            draw_sm: &gfx.draw_shader_3d,
+            instance_sm: &gfx.instance_shader_3d,
+            instance_unordered_sm: &gfx.instance_unordered_shader_3d,
 
             transform,
             curr_image: None,
@@ -221,12 +214,12 @@ impl<'a> InternalCanvas3d<'a> {
 
     pub fn set_shader_params(
         &mut self,
-        bind_group: ArcBindGroup,
-        layout: ArcBindGroupLayout,
+        bind_group: wgpu::BindGroup,
+        layout: wgpu::BindGroupLayout,
         offset: u32,
     ) {
         self.dirty_pipeline = true;
-        self.shader_bind_group = Some((self.arenas.bind_groups.alloc(bind_group), layout, offset));
+        self.shader_bind_group = Some((bind_group, layout, offset));
     }
 
     pub fn reset_shader_params(&mut self) {
@@ -289,7 +282,6 @@ impl<'a> InternalCanvas3d<'a> {
         self.uniform_alloc = Some(uniform_alloc);
     }
 
-    #[allow(unsafe_code)]
     pub fn draw_mesh(&mut self, mesh: &'a RenderedMesh3d, image: &Image, idx: usize) {
         self.update_pipeline(ShaderType3d::Draw);
 
@@ -314,7 +306,7 @@ impl<'a> InternalCanvas3d<'a> {
 
         self.pass.set_bind_group(
             0,
-            &**self.arenas.bind_groups.alloc(uniform_bind_group),
+            &uniform_bind_group,
             &[offset as u32], // <- the dynamic offset
         );
 
@@ -372,12 +364,9 @@ impl<'a> InternalCanvas3d<'a> {
             uniforms.as_std140().as_bytes(),
         );
 
-        self.pass.set_bind_group(
-            0,
-            &**self.arenas.bind_groups.alloc(uniform_bind_group),
-            &[uniform_alloc.offset as u32],
-        );
-        self.pass.set_bind_group(2, &*instances.bind_group, &[]);
+        self.pass
+            .set_bind_group(0, &uniform_bind_group, &[uniform_alloc.offset as u32]);
+        self.pass.set_bind_group(2, &instances.bind_group, &[]);
 
         self.pass.set_vertex_buffer(0, mesh.vert_buffer.slice(..)); // These buffers should always exist if I recall correctly
         self.pass
@@ -430,24 +419,23 @@ impl<'a> InternalCanvas3d<'a> {
             let (dummy_group, dummy_layout) =
                 BindGroupBuilder::new().create(&self.wgpu.device, self.bind_group_cache);
 
-            let mut groups = vec![uniform_layout, texture_layout];
+            let mut groups = vec![&uniform_layout, &texture_layout];
 
             if let ShaderType3d::Instance { .. } = ty {
-                groups.push(instance_layout);
+                groups.push(&instance_layout);
             } else {
                 // the dummy group ensures the user's bind group is at index 3
-                groups.push(dummy_layout);
-                self.pass
-                    .set_bind_group(2, &**self.arenas.bind_groups.alloc(dummy_group), &[]);
+                groups.push(&dummy_layout);
+                self.pass.set_bind_group(2, &dummy_group, &[]);
             }
 
             let shader = match ty {
                 ShaderType3d::Draw | ShaderType3d::Instance { .. } => {
-                    if let Some((bind_group, ref bind_group_layout, offset)) =
+                    if let Some((ref bind_group, ref bind_group_layout, offset)) =
                         self.shader_bind_group
                     {
                         self.pass.set_bind_group(3, bind_group, &[offset]);
-                        groups.push(bind_group_layout.clone());
+                        groups.push(bind_group_layout);
                     }
 
                     &self.shader
@@ -455,54 +443,50 @@ impl<'a> InternalCanvas3d<'a> {
             };
 
             let layout = self.pipeline_cache.layout(&self.wgpu.device, &groups);
-            let pipeline = self
-                .arenas
-                .render_pipelines
-                .alloc(self.pipeline_cache.render_pipeline(
-                    &self.wgpu.device,
-                    layout.as_ref(),
-                    RenderPipelineInfo {
-                        layout_id: layout.id(),
-                        vs: if let Some(vs_module) = &shader.vs_module {
-                            vs_module.clone()
-                        } else {
-                            match ty {
-                                ShaderType3d::Draw => self.draw_sm.clone(),
-                                ShaderType3d::Instance { ordered } => {
-                                    if ordered {
-                                        self.instance_sm.clone()
-                                    } else {
-                                        self.instance_unordered_sm.clone()
-                                    }
+            let pipeline = self.pipeline_cache.render_pipeline(
+                &self.wgpu.device,
+                RenderPipelineInfo {
+                    layout,
+                    vs: if let Some(vs_module) = &shader.vs_module {
+                        vs_module.clone()
+                    } else {
+                        match ty {
+                            ShaderType3d::Draw => self.draw_sm.clone(),
+                            ShaderType3d::Instance { ordered } => {
+                                if ordered {
+                                    self.instance_sm.clone()
+                                } else {
+                                    self.instance_unordered_sm.clone()
                                 }
                             }
-                        },
-                        fs: if let Some(fs_module) = &shader.fs_module {
-                            fs_module.clone()
-                        } else {
-                            match ty {
-                                ShaderType3d::Draw | ShaderType3d::Instance { .. } => {
-                                    self.draw_sm.clone()
-                                }
-                            }
-                        },
-                        vs_entry: "vs_main".into(),
-                        fs_entry: "fs_main".into(),
-                        samples: self.samples,
-                        format: self.format,
-                        blend: Some(wgpu::BlendState {
-                            color: self.blend_mode.color,
-                            alpha: self.blend_mode.alpha,
-                        }),
-                        depth: Some(wgpu::CompareFunction::Less),
-                        vertices: true,
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        vertex_layout: Vertex3d::desc(),
-                        cull_mode: Some(wgpu::Face::Back),
+                        }
                     },
-                ));
+                    fs: if let Some(fs_module) = &shader.fs_module {
+                        fs_module.clone()
+                    } else {
+                        match ty {
+                            ShaderType3d::Draw | ShaderType3d::Instance { .. } => {
+                                self.draw_sm.clone()
+                            }
+                        }
+                    },
+                    vs_entry: "vs_main",
+                    fs_entry: "fs_main",
+                    samples: self.samples,
+                    format: self.format,
+                    blend: Some(wgpu::BlendState {
+                        color: self.blend_mode.color,
+                        alpha: self.blend_mode.alpha,
+                    }),
+                    depth: Some(wgpu::CompareFunction::Less),
+                    vertices: true,
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    vertex_layout: Vertex3d::desc(),
+                    cull_mode: Some(wgpu::Face::Back),
+                },
+            );
 
-            self.pass.set_pipeline(pipeline);
+            self.pass.set_pipeline(&pipeline);
         }
     }
 
@@ -511,16 +495,15 @@ impl<'a> InternalCanvas3d<'a> {
             || self
                 .curr_image
                 .as_ref()
-                .map_or(true, |curr| curr.id() != image.view.id())
+                .map_or(true, |curr| *curr != image.view)
         {
             self.curr_sampler = self.next_sampler;
             let sample = self.sampler_cache.get(&self.wgpu.device, self.curr_sampler);
-            let image_bind = image.fetch_buffer(sample.id(), sample, &self.wgpu.device);
+            let image_bind = image.fetch_buffer(sample, &self.wgpu.device);
 
             self.curr_image = Some(image.view);
 
-            self.pass
-                .set_bind_group(1, &**self.arenas.bind_groups.alloc(image_bind), &[]);
+            self.pass.set_bind_group(1, &image_bind, &[]);
         }
     }
 }
@@ -533,7 +516,7 @@ impl Drop for InternalCanvas3d<'_> {
 
 #[derive(Debug)]
 pub struct InstanceArrayView3d {
-    pub bind_group: ArcBindGroup,
+    pub bind_group: wgpu::BindGroup,
     pub image: Image,
     pub len: u32,
     pub ordered: bool,
